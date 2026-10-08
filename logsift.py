@@ -9,7 +9,10 @@ Adding files
     Drag folders or CSV files from your file manager onto the terminal window.
     (The terminal pastes the path; logsift picks it up. If your terminal types
     the path into the filter box instead, just press Enter.)
-    Folders are searched recursively for *.csv.
+    Folders are searched recursively for .csv, .tsv, .tab, .xlsx and .xlsm
+    files. A file dropped directly is read as delimited text whatever its
+    extension (comma, tab, semicolon or pipe is detected). Excel workbooks
+    are read once per sheet; each sheet shows up as "book.xlsx [Sheet1]".
 
 Filter syntax (space-separated terms are ANDed together)
     src=10.1.1.5              exact match (case-insensitive)
@@ -95,9 +98,9 @@ def _bootstrap() -> None:
             venv.create(home, with_pip=True)
         probe = subprocess.run([str(py), "-c", "import textual"], capture_output=True)
         if probe.returncode != 0:
-            print("logsift: downloading the 'textual' package...")
+            print("logsift: downloading the 'textual' and 'openpyxl' packages...")
             subprocess.check_call([str(py), "-m", "pip", "install", "--quiet",
-                                   "--disable-pip-version-check", "textual"])
+                                   "--disable-pip-version-check", "textual", "openpyxl"])
     except Exception as e:
         sys.exit(f"logsift: automatic setup failed ({e}).\n"
                  "Check your internet connection, or install manually:  pip install textual")
@@ -111,6 +114,28 @@ try:
     import textual  # noqa: F401
 except ImportError:
     _bootstrap()
+
+
+def _have_openpyxl() -> bool:
+    """Excel support needs openpyxl; fetch it once if we run in our private environment."""
+    import importlib.util
+    if importlib.util.find_spec("openpyxl"):
+        return True
+    home = Path.home() / ".logsift" / "venv"
+    if Path(sys.prefix).resolve() != home.resolve() or __name__ != "__main__":
+        return False
+    import subprocess
+    print("logsift: adding Excel support (one time only)...")
+    done = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                           "--disable-pip-version-check", "openpyxl"], capture_output=True)
+    importlib.invalidate_caches()
+    return done.returncode == 0 and importlib.util.find_spec("openpyxl") is not None
+
+
+HAVE_XLSX = _have_openpyxl()
+EXCEL_EXT = {".xlsx", ".xlsm"}
+TEXT_EXT = {".csv", ".tsv", ".tab"}          # picked up when a folder is loaded
+CACHE_DIR = Path.home() / ".logsift" / "cache"
 
 from rich.text import Text
 from textual import work
@@ -201,12 +226,18 @@ def norm(name: str) -> str:
 
 
 class CsvFile:
-    def __init__(self, path: Path):
-        self.path = path
+    """One table: a delimited text file, or one sheet of a workbook (converted to CSV)."""
+
+    def __init__(self, path: Path, source: Path | None = None, sheet: str = ""):
+        self.path = path                               # the text file that is scanned
+        self.source = source or path                   # the file the user loaded
+        self.name = f"{self.source.name} [{sheet}]" if sheet else self.source.name
         self.size = path.stat().st_size
         with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
             first = fh.readline()
         self.delim = max(",;\t|", key=lambda d: first.count(d)) if first.strip() else ","
+        if self.source.suffix.lower() in (".tsv", ".tab") and "\t" in first:
+            self.delim = "\t"
         self.header = next(csv.reader([first], delimiter=self.delim), [])
         self.header = [h.strip() for h in self.header]
         self.colmap: dict[str, int] = {}
@@ -514,6 +545,71 @@ def plan_file(path: str, delim: str) -> dict:
         return {"error": str(e)}
 
 
+def _cell(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else repr(v)
+    if isinstance(v, dt.datetime):
+        return v.strftime("%Y-%m-%d" if v.time() == dt.time(0) else "%Y-%m-%d %H:%M:%S")
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    return str(v)
+
+
+def convert_xlsx(path: str, cache_dir: str):
+    """Write each non-empty sheet of a workbook to a CSV in the cache.
+
+    Returns [(sheet name, csv path), ...] or an error string. The cache file
+    name includes the workbook's size and modification time, so an unchanged
+    workbook is converted only once.
+    """
+    try:
+        import hashlib
+        import openpyxl
+        st = os.stat(path)
+        tag = hashlib.sha1(f"{path}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:16]
+        os.makedirs(cache_dir, exist_ok=True)
+        index = os.path.join(cache_dir, tag + ".idx")
+        if os.path.exists(index):
+            with open(index, newline="", encoding="utf-8") as fh:
+                done = [tuple(r) for r in csv.reader(fh)]
+            if all(os.path.exists(p) for _, p in done):
+                for _, p in done:
+                    os.utime(p)
+                os.utime(index)
+                return done
+        out = []
+        book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            for n, ws in enumerate(book.worksheets):
+                if not hasattr(ws, "iter_rows"):          # chart sheet
+                    continue
+                target = os.path.join(cache_dir, f"{tag}.{n}.csv")
+                rows = 0
+                with open(target + ".part", "w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [_cell(v) for v in row]
+                        while cells and not cells[-1]:
+                            cells.pop()
+                        if cells:
+                            w.writerow(cells)
+                            rows += 1
+                if rows:
+                    os.replace(target + ".part", target)
+                    out.append((ws.title, target))
+                else:
+                    os.unlink(target + ".part")
+        finally:
+            book.close()
+        with open(index, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(out)
+        return out
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 def _compile(task):
     """(tests, needle groups, anti-needle groups, colmap) for this query against this file's header; cached."""
     key = (task["query"], task["header"])
@@ -693,7 +789,7 @@ class Engine:
                     if got is None:
                         return
                     yield got
-                task = dict(base, path=str(f.path), name=f.path.name, start=a, end=b,
+                task = dict(base, path=str(f.path), name=f.name, start=a, end=b,
                             delim=f.delim, header=tuple(f.header))
                 if per_task:
                     per_task(task)
@@ -997,6 +1093,7 @@ class LogSift(App):
         self.initial_paths = paths
         self.max_rows = max_rows
         self.files: dict[Path, CsvFile] = {}
+        self.sources: set[Path] = set()          # files the user loaded (incl. workbooks)
         self.known: dict[str, str] = {}      # normalised name -> display name
         self.conds: list[Cond] = []
         self.show_all = False
@@ -1136,38 +1233,87 @@ class LogSift(App):
             self.add_paths(paths)
 
     def add_paths(self, paths: list[Path]) -> None:
-        added, bad, new = 0, [], []
+        bad, new, books = [], [], []
         for p in paths:
             try:
                 p = p.resolve()
                 if p.is_dir():
-                    found = sorted(q for q in p.rglob("*")
-                                   if q.is_file() and q.suffix.lower() == ".csv")
+                    found = sorted(q for q in p.rglob("*") if q.is_file()
+                                   and q.suffix.lower() in TEXT_EXT | EXCEL_EXT
+                                   and not q.name.startswith("~$"))
                 else:
                     found = [p]
                 for q in found:
-                    if q not in self.files:
-                        f = self.files[q] = CsvFile(q)
-                        self.engine.plan(f)
-                        new.append(f)
-                        added += 1
+                    if q in self.sources:
+                        continue
+                    if q.suffix.lower() in EXCEL_EXT:
+                        books.append(q)
+                    elif q.suffix.lower() == ".xls":
+                        bad.append(f"{q.name}: old .xls format is not supported; "
+                                   "save it as .xlsx or .csv")
+                    else:
+                        new.append(CsvFile(q))
+                    self.sources.add(q)
             except OSError as e:
                 bad.append(f"{p.name}: {e}")
+        if books and not HAVE_XLSX:
+            bad.append(f"{len(books)} Excel file(s) skipped: Excel support needs the "
+                       "'openpyxl' package (pip install openpyxl)")
+            self.sources.difference_update(books)
+            books = []
+        if bad:
+            self.notify("\n".join(bad[:5]), severity="error", timeout=10)
+        self.take_tables(new)
+        if books:
+            self.convert(books)
+
+    def take_tables(self, new: list[CsvFile]) -> None:
+        """Take newly readable tables into the app and refresh the search."""
+        for f in new:
+            self.files[f.path] = f
+            self.engine.plan(f)
         self.known = {}
         for f in self.files.values():
             for h in f.header:
                 if h:
                     self.known.setdefault(norm(h), h)
-        if bad:
-            self.notify("\n".join(bad[:5]), severity="error")
-        self.notify(f"Added {added} file(s); {len(self.files)} loaded.")
-        self.build_index(new)
+        if new:
+            self.notify(f"Added {len(new)} table(s); {len(self.files)} loaded.")
+            self.build_index(new)
         self.start_search()
+
+    @work(thread=True, group="convert")
+    def convert(self, books: list[Path]) -> None:
+        """Have the worker processes turn Excel sheets into CSV, then load those."""
+        worker = get_current_worker()
+        jobs = [(b, self.engine.pool.apply_async(convert_xlsx, (str(b), str(CACHE_DIR))))
+                for b in books]
+        for n, (book, job) in enumerate(jobs, 1):
+            self.call_from_thread(self.notify, f"Reading {book.name} ({n} of {len(jobs)})…")
+            res = Engine._wait(job, lambda: worker.is_cancelled)
+            if res is None:
+                return
+            if not isinstance(res, list):
+                self.call_from_thread(self.notify, f"{book.name}: {res}", severity="error",
+                                      timeout=10)
+                continue
+            try:
+                new = [CsvFile(Path(p), book, sheet) for sheet, p in res]
+            except OSError as e:
+                self.call_from_thread(self.notify, f"{book.name}: {e}", severity="error")
+                continue
+            if not new:
+                self.call_from_thread(self.notify, f"{book.name}: no data found",
+                                      severity="warning")
+            elif not worker.is_cancelled:
+                self.call_from_thread(self.take_tables, new)
 
     def action_clear_files(self) -> None:
         self.gen += 1
         self.workers.cancel_group(self, "scan")
         self.workers.cancel_group(self, "index")
+        self.workers.cancel_group(self, "convert")
+        self.sources.clear()
         self.engine.bump(SLOT_SCAN)
         self.value_index, self._value_counts = {}, {}
         self.files, self.known, self.shown, self.loaded = {}, {}, [], 0
@@ -1276,7 +1422,7 @@ class LogSift(App):
                     shown += len(rows)
                     batch.extend((f, r) for r in rows)
             else:
-                errors.append(f"{f.path.name}: {res}")
+                errors.append(f"{f.name}: {res}")
             if batch or time.monotonic() - last > 0.15:
                 flush()
         if not worker.is_cancelled:
@@ -1309,7 +1455,7 @@ class LogSift(App):
         chunk = self.shown[self.loaded:min(want, self.loaded + step)]
         out = []
         for f, row in chunk:
-            cells = [Text(f.path.name)]
+            cells = [Text(f.name)]
             for c in cols:
                 i = f.colmap.get(c)
                 v = row[i] if i is not None and i < len(row) else ""
@@ -1351,7 +1497,7 @@ class LogSift(App):
             return
         f, row = self.shown[event.cursor_row]
         body = Text()
-        body.append(f"{f.path}\n\n", style="bold")
+        body.append(f"{f.source}{f.name[len(f.source.name):]}\n\n", style="bold")
         width = max((len(h) for h in f.header), default=0)
         for h, v in zip(f.header, row):
             if v.strip():
@@ -1370,7 +1516,7 @@ class LogSift(App):
         body = Text()
         body.append(f"{len(self.files)} file(s) loaded\n\n", style="bold")
         for f in self.files.values():
-            body.append(f"{f.path}  ", style="cyan")
+            body.append(f"{f.source}{f.name[len(f.source.name):]}  ", style="cyan")
             body.append(f"({len(f.header)} columns)\n", style="dim")
         self.push_screen(TextScreen(body))
 
@@ -1474,6 +1620,12 @@ def main() -> None:
     missing = [p for p in args.paths if not p.exists()]
     if missing:
         sys.exit("Not found: " + ", ".join(map(str, missing)))
+    try:                          # forget converted workbooks not used for 30 days
+        for old in CACHE_DIR.glob("*"):
+            if time.time() - old.stat().st_mtime > 30 * 86400:
+                old.unlink()
+    except OSError:
+        pass
     engine = Engine()             # start worker processes before the UI takes the terminal
     try:
         LogSift(args.paths, args.max_rows, engine,

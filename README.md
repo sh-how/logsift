@@ -1,10 +1,18 @@
 # logsift
 
-Search and filter many CSV log files at once from a terminal app. Drag a folder onto the window, type `src=10.1.1.5 action=drop`, and see matching rows from every file.
+Search and filter many CSV, TSV and Excel log files at once from a terminal app. Drag a folder onto the window, type `src=10.1.1.5 action=drop`, and see matching rows from every file.
 
 ![logsift filtering three firewall log files](screenshots/1-filter.png)
 
-It was built for firewall log exports, but it works with any CSV that has a header row: column names are read from the files themselves.
+It was built for firewall log exports, but it works with any table that has a header row: column names are read from the files themselves.
+
+| File type | Notes |
+| --- | --- |
+| `.csv`, `.tsv`, `.tab` | Comma, tab, semicolon and pipe delimiters are detected per file. |
+| `.xlsx`, `.xlsm` | Every non-empty sheet is loaded as its own table, shown as `book.xlsx [Sheet1]`. |
+| anything else, dropped directly | Read as delimited text, whatever the extension. |
+
+Old-format `.xls` workbooks are not supported; save them as `.xlsx` or `.csv` first.
 
 ## Setup
 
@@ -16,7 +24,7 @@ cd logsift
 python logsift.py
 ```
 
-The first run downloads its one dependency ([Textual](https://textual.textualize.io/)) into a private folder, `~/.logsift`, then starts. This takes about a minute and needs internet once. Later runs start immediately. Nothing is installed into your system Python.
+The first run downloads its two dependencies ([Textual](https://textual.textualize.io/) for the interface and [openpyxl](https://openpyxl.readthedocs.io/) for Excel files) into a private folder, `~/.logsift`, then starts. This takes about a minute and needs internet once. Later runs start immediately. Nothing is installed into your system Python.
 
 To try it with the sample logs in this repository:
 
@@ -24,13 +32,13 @@ To try it with the sample logs in this repository:
 python logsift.py examples
 ```
 
-If setup goes wrong, delete `~/.logsift` and run it again. To install the dependency yourself instead, run `pip install textual`.
+If setup goes wrong, delete `~/.logsift` and run it again. To install the dependencies yourself instead, run `pip install textual openpyxl`.
 
 ## How to use
 
 ### 1. Load files
 
-Drag folders or CSV files from your file manager onto the terminal window. Folders are searched recursively for `*.csv`. You can also pass them on the command line:
+Drag folders or files from your file manager onto the terminal window. Folders are searched recursively for `.csv`, `.tsv`, `.tab`, `.xlsx` and `.xlsm` files. You can also pass them on the command line:
 
 ```
 python logsift.py /path/to/logs another.csv
@@ -128,7 +136,9 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 - Result rows are added to the table as you scroll, so wide tables stay quick.
 - Files with different headers can be loaded together. A filter on a column that a file lacks skips that file, and the status line says how many were skipped.
 - Comma, semicolon, tab and pipe delimiters are detected per file.
-- The first line of each file is treated as the header.
+- An Excel workbook is converted to CSV the first time it is loaded, which takes roughly 10 to 20 seconds per 100,000 rows. The converted copy is kept in `~/.logsift/cache`, so loading the same unchanged workbook again is immediate. Copies not used for 30 days are deleted. Searching a workbook is as fast as searching a CSV.
+- Excel dates are shown as `2026-10-07` or `2026-10-07 12:30:00`, and formulas as their last calculated value.
+- The first non-empty row of each file or sheet is treated as the header.
 - Date comparison understands `7Oct2026`, `2026-10-07`, `07/10/2026` and similar. Other formats are compared as text.
 - By default the table shows `date`, `time`, `orig`, `action`, `src`, `dst`, `proto`, `service`, `s_port`, `rule`, interface, NAT and `user` columns when they exist, plus any column you filter on. For CSVs with none of these it shows the first 15 columns. F2 shows everything.
 
