@@ -65,6 +65,7 @@ Type terms in the filter box and press Enter. Terms separated by spaces must all
 | `scheme=IKE` | a trailing colon in a column name (`scheme:`) is optional |
 | `vpn-gw-01` | bare word: any column contains it |
 | `!keepalive` | no column contains it |
+| `file=fw01*` | file name; works with `=`, `!=`, `~` and `!~` like any column |
 
 A mistyped column name gets a suggestion, for example `actoin` gives "Did you mean: action".
 
@@ -134,6 +135,7 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 - Terms such as `src=10.1.1.5`, `action=drop|reject`, `dst=192.168.0.0/16` or `fw_message~timeout` are the fastest: lines that do not contain that text are rejected before they are parsed. Comparisons (`>`, `<`), regular expressions and "not" terms have to parse every line and are slower.
 - On a 2-core machine, two 250 MB files (1.8 million rows, 86 columns) take about 1.5 to 2.5 seconds for the fast terms and about 5 seconds for the slow ones.
 - Result rows are added to the table as you scroll, so wide tables stay quick.
+- `file` filters on the file name (for an Excel sheet, `book.xlsx [Sheet1]`), and files that do not match are not read at all. If a file has its own column called `file`, that column is filtered instead.
 - Files with different headers can be loaded together. A filter on a column that a file lacks skips that file, and the status line says how many were skipped.
 - Comma, semicolon, tab and pipe delimiters are detected per file.
 - An Excel workbook is converted to CSV the first time it is loaded, which takes roughly 10 to 20 seconds per 100,000 rows. The converted copy is kept in `~/.logsift/cache`, so loading the same unchanged workbook again is immediate. Copies not used for 30 days are deleted. Searching a workbook is as fast as searching a CSV.

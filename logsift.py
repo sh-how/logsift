@@ -28,6 +28,7 @@ Filter syntax (space-separated terms are ANDed together)
     scheme=IKE                trailing colons in column names are optional
     vpn-gw-01                 bare word: any column contains it
     !keepalive                no column contains it
+    file=fw01*                file name (also file~, file!=, file!~)
 
 Suggestions
     As you type, the filter box suggests column names, and after "column="
@@ -158,6 +159,7 @@ PREFERRED = [
 PAGE = 200               # result rows added to the table ahead of the cursor
 CELL_WIDTH = 48          # long cells are truncated in the table (not in details)
 CHUNK = 16 << 20         # bytes of a file handed to one worker process at a time
+FILE_COL = "file"        # filter on the file name, unless a file has its own "file" column
 
 
 # --------------------------------------------------------------------------
@@ -393,6 +395,13 @@ class Cond:
         self.anti = found if self.negate and col is None else None
 
 
+def name_matches(conds: list[Cond], name: str, colmap: dict[str, int]) -> bool:
+    """Whether a table named `name` passes the filter's file-name terms (file=...)."""
+    if FILE_COL in colmap:                    # the file's own "file" column is filtered instead
+        return True
+    return all(bool(c.test(name)) != c.negate for c in conds if c.col == FILE_COL)
+
+
 def parse_query(text: str, known: dict[str, str]) -> list[Cond]:
     conds = []
     for tok in split_tokens(text, escapes=False):
@@ -612,7 +621,7 @@ def convert_xlsx(path: str, cache_dir: str):
 
 def _compile(task):
     """(tests, needle groups, anti-needle groups, colmap) for this query against this file's header; cached."""
-    key = (task["query"], task["header"])
+    key = (task["query"], task["header"], task["name"])
     hit = _COMPILED.get(key)
     if hit is None:
         if len(_COMPILED) > 256:
@@ -621,7 +630,12 @@ def _compile(task):
         for i, h in enumerate(task["header"]):
             colmap.setdefault(norm(h), i)
         tests, groups, anti = [], [], []
-        for c in parse_query(task["query"], dict(task["known"])):
+        conds = parse_query(task["query"], dict(task["known"]))
+        if not name_matches(conds, task["name"], colmap):
+            conds, tests = [], None
+        for c in conds:
+            if c.col == FILE_COL and FILE_COL not in colmap:
+                continue                      # file name already checked above
             idx = None if c.col is None else colmap.get(c.col, -1)
             if idx == -1:
                 if c.negate:
@@ -1159,7 +1173,7 @@ class LogSift(App):
 
         for m in OP_RE.finditer(body):
             left = body[:m.start()]
-            if not (left.strip() and norm(left) in self.known):
+            if not (left.strip() and norm(left) in self.query_known):
                 continue
             rest = body[m.end():]
             if m.group() not in ("=", "!=", "~", "!~") or rest.startswith("/"):
@@ -1172,7 +1186,10 @@ class LogSift(App):
                 return []
             partial = rest.rpartition("|")[2]
             low = partial.lower()
-            for v in self.value_index.get(norm(left), ()):
+            values = self.value_index.get(norm(left), [])
+            if norm(left) == FILE_COL:
+                values = list(dict.fromkeys([f.name for f in self.files.values()] + values))
+            for v in values:
                 if len(v) <= len(partial) or not v.lower().startswith(low):
                     continue
                 if '"' in v or "'" in v or (not closing and re.search(r"[\s|]", v)):
@@ -1186,7 +1203,7 @@ class LogSift(App):
             return []
         low = body.lower()
         names = []
-        for disp in self.known.values():
+        for disp in self.query_known.values():
             name = disp.rstrip(":").strip()
             if name.lower().startswith(low) and (lead or " " not in name):
                 names.append(name)
@@ -1333,7 +1350,7 @@ class LogSift(App):
     def default_columns(self) -> list[str]:
         cols = [c for c in PREFERRED if c in self.known]
         for c in self.conds:                     # always show what you filter on
-            if c.col and c.col not in cols:
+            if c.col and c.col in self.known and c.col not in cols:
                 cols.append(c.col)
         return cols or list(self.known)[:15]
 
@@ -1346,15 +1363,22 @@ class LogSift(App):
                 return cols
         return self.default_columns()
 
+    @property
+    def query_known(self) -> dict[str, str]:
+        """Columns the filter accepts: the loaded columns plus the file name."""
+        return {FILE_COL: "file", **self.known}
+
     def task_base(self, slot: int, mode: str, query: str, **extra) -> dict:
         return dict(slot=slot, gen=self.engine.bump(slot), mode=mode, query=query,
-                    known=tuple(self.known.items()), limit=self.max_rows, **extra)
+                    known=tuple(self.query_known.items()), limit=self.max_rows, **extra)
 
     def usable_files(self, conds: list[Cond]) -> tuple[list[CsvFile], int]:
-        """Files that have every column the filter needs, and how many do not."""
+        """Files whose name passes and that have every column the filter needs,
+        and how many of the name-passing files lack a column."""
         need = {c.col for c in conds if c.col and not c.negate}
-        files = [f for f in self.files.values() if need <= f.colmap.keys()]
-        return files, len(self.files) - len(files)
+        named = [f for f in self.files.values() if name_matches(conds, f.name, f.colmap)]
+        files = [f for f in named if need - {FILE_COL} <= f.colmap.keys()]
+        return files, len(named) - len(files)
 
     def start_search(self) -> None:
         if not self.files:
@@ -1362,7 +1386,7 @@ class LogSift(App):
             return
         text = self.w_filter.value
         try:
-            self.conds = parse_query(text, self.known)
+            self.conds = parse_query(text, self.query_known)
         except QueryError as e:
             self.set_status(str(e), error=True)
             return
@@ -1559,7 +1583,7 @@ class LogSift(App):
             return
         text = self.w_filter.value
         try:
-            conds = parse_query(text, self.known)
+            conds = parse_query(text, self.query_known)
         except QueryError as e:
             self.set_status(str(e), error=True)
             return
