@@ -138,7 +138,7 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 - Comma, semicolon, tab and pipe delimiters are detected per file.
 - An Excel workbook is converted to CSV the first time it is loaded, which takes roughly 10 to 20 seconds per 100,000 rows. The converted copy is kept in `~/.logsift/cache`, so loading the same unchanged workbook again is immediate. Copies not used for 30 days are deleted. Searching a workbook is as fast as searching a CSV.
 - Excel dates are shown as `2026-10-07` or `2026-10-07 12:30:00`, and formulas as their last calculated value.
-- The first non-empty row of each file or sheet is treated as the header.
+- The first line of each text file, and the first non-empty row of each Excel sheet, is treated as the header.
 - Date comparison understands `7Oct2026`, `2026-10-07`, `07/10/2026` and similar. Other formats are compared as text.
 - By default the table shows `date`, `time`, `orig`, `action`, `src`, `dst`, `proto`, `service`, `s_port`, `rule`, interface, NAT and `user` columns when they exist, plus any column you filter on. For CSVs with none of these it shows the first 15 columns. F2 shows everything.
 
