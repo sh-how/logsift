@@ -40,6 +40,13 @@ Keys
        (within the current filter); Enter on a value adds it to the filter
     F8 clear files   Esc back to filter   Ctrl+Q quit
 
+Editing the filter
+    Ctrl+U  clear the filter box (deletes everything before the cursor);
+            then press Enter to show all rows again
+    Ctrl+K  delete everything after the cursor
+    Ctrl+W  delete the word before the cursor
+    Home / End   jump to the start / end of the filter
+
 Large files
     Files are scanned in pieces by several worker processes (one per CPU core,
     up to 8), so the window stays responsive while a search runs, and a new

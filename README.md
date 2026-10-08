@@ -96,6 +96,9 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 | F4 | distinct values of a column |
 | F5 | export matches to CSV |
 | F8 | clear loaded files |
+| Ctrl+U | clear the filter box (deletes everything before the cursor); press Enter to show all rows again |
+| Ctrl+K | delete everything after the cursor |
+| Ctrl+W | delete the word before the cursor |
 | Esc | close a popup, or return to the filter box |
 | Ctrl+Q | quit |
 
