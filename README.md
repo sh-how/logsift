@@ -80,7 +80,23 @@ Press Tab to move to the results, then Enter on a row to see all of its non-empt
 
 ![All fields of one row](screenshots/4-details.png)
 
-### 6. Export
+### 6. Choose which columns to show
+
+Press F6 to open the column list and tick the columns you want in the results table.
+
+- Type to narrow the list, then press Down to move into it.
+- Space ticks or unticks a column. Enter applies. Esc cancels.
+- Ctrl+D unticks everything, so you can start from an empty set. Ctrl+R restores the default set.
+
+Your choice stays for the rest of the session, across searches. F2 still switches to all columns and back. Applying with nothing ticked returns to the default set.
+
+To start with columns already chosen:
+
+```
+python logsift.py /path/to/logs --columns date,time,src,dst,action
+```
+
+### 7. Export
 
 Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the current directory. The export has a `source_file` column and all columns from the loaded files.
 
@@ -91,10 +107,11 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 | Enter | run the filter; on a result row, show its details |
 | Tab | accept a suggestion, otherwise switch between filter box and results |
 | F1 | help and the list of columns |
-| F2 | switch between key columns and all columns |
+| F2 | switch between your chosen (or key) columns and all columns |
 | F3 | list loaded files |
 | F4 | distinct values of a column |
 | F5 | export matches to CSV |
+| F6 | choose which columns to show |
 | F8 | clear loaded files |
 | Ctrl+U | clear the filter box (deletes everything before the cursor); press Enter to show all rows again |
 | Ctrl+K | delete everything after the cursor |

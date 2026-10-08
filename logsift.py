@@ -36,6 +36,10 @@ Keys
     Enter   run the filter / open row details (when the table is focused)
     Tab     accept suggestion, otherwise switch between filter box and results
     F1 help   F2 toggle all columns   F3 list files   F5 export matches
+    F6 choose columns: tick the columns you want in the results table
+       (type to narrow the list, Space ticks, Enter applies, Esc cancels,
+       Ctrl+D unticks all, Ctrl+R restores the default set).
+       Start with them already chosen:  --columns date,src,dst,action
     F4 values: type a column name to list its distinct values with counts
        (within the current filter); Enter on a value adds it to the filter
     F8 clear files   Esc back to filter   Ctrl+Q quit
@@ -115,7 +119,8 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.suggester import SuggestFromList, Suggester
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, SelectionList, Static
+from textual.widgets.selection_list import Selection
 from textual.worker import get_current_worker
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -884,6 +889,86 @@ class ValuesScreen(ModalScreen):
             self.dismiss((self.app.known[self.col], self.values[event.cursor_row]))
 
 
+class ColumnsScreen(ModalScreen):
+    """Tick the columns to show in the results table."""
+    BINDINGS = [
+        Binding("enter", "apply", "Apply", priority=True),
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+d", "none", "Untick all", priority=True),
+        Binding("ctrl+r", "default", "Default set", priority=True),
+    ]
+    DEFAULT_CSS = """
+    ColumnsScreen { align: center middle; }
+    ColumnsScreen > Vertical {
+        width: 70; max-width: 90%; height: 85%; border: round $accent;
+        background: $surface; padding: 1 2;
+    }
+    ColumnsScreen #cstatus { height: 1; color: $text-muted; }
+    ColumnsScreen SelectionList { height: 1fr; }
+    """
+
+    def __init__(self, known: dict[str, str], chosen: list[str], default: list[str]) -> None:
+        super().__init__()
+        self.known, self.default = known, default
+        self.chosen = set(chosen)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Input(id="cfind", placeholder="type to narrow the list")
+            yield Static(id="cstatus")
+            yield SelectionList()
+
+    def on_mount(self) -> None:
+        self.refill("")
+        self.query_one(SelectionList).focus()
+
+    def refill(self, needle: str) -> None:
+        needle = needle.strip().lower()
+        box = self.query_one(SelectionList)
+        box.clear_options()
+        box.add_options(Selection(disp, key, key in self.chosen)
+                        for key, disp in self.known.items() if needle in disp.lower())
+        if box.option_count:
+            box.highlighted = 0
+        self.count()
+
+    def count(self) -> None:
+        self.query_one("#cstatus", Static).update(
+            f"{len(self.chosen)} of {len(self.known)} columns ticked · "
+            "Space ticks · Enter applies · Esc cancels")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        event.stop()
+        self.refill(event.value)
+
+    def on_selection_list_selection_toggled(self, event) -> None:
+        key = event.selection.value
+        if key in event.selection_list.selected:
+            self.chosen.add(key)
+        else:
+            self.chosen.discard(key)
+        self.count()
+
+    def on_key(self, event) -> None:
+        if event.key == "down" and isinstance(self.focused, Input):
+            event.stop()
+            self.query_one(SelectionList).focus()
+
+    def action_apply(self) -> None:
+        self.dismiss([k for k in self.known if k in self.chosen])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_none(self) -> None:
+        self.chosen.clear()
+        self.refill(self.query_one("#cfind", Input).value)
+
+    def action_default(self) -> None:
+        self.chosen = set(self.default)
+        self.refill(self.query_one("#cfind", Input).value)
+
+
 class LogSift(App):
     TITLE = "logsift"
     CSS = """
@@ -897,13 +982,16 @@ class LogSift(App):
         Binding("f3", "files", "Files", priority=True),
         Binding("f4", "values", "Values", priority=True),
         Binding("f5", "export", "Export", priority=True),
+        Binding("f6", "columns", "Columns", priority=True),
         Binding("f8", "clear_files", "Clear files", priority=True),
         Binding("escape", "focus_filter", "Filter"),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, paths: list[Path], max_rows: int, engine: Engine | None = None):
+    def __init__(self, paths: list[Path], max_rows: int, engine: Engine | None = None,
+                 columns: list[str] | None = None):
         super().__init__()
+        self.custom_cols = [norm(c) for c in columns] if columns else None   # set by F6
         self.engine = engine or Engine()
         self.query_text = ""                 # the filter as last run
         self.initial_paths = paths
@@ -1096,14 +1184,21 @@ class LogSift(App):
         else:
             self.start_search()
 
-    def visible_columns(self) -> list[str]:
-        if self.show_all:
-            return list(self.known)
+    def default_columns(self) -> list[str]:
         cols = [c for c in PREFERRED if c in self.known]
         for c in self.conds:                     # always show what you filter on
             if c.col and c.col not in cols:
                 cols.append(c.col)
         return cols or list(self.known)[:15]
+
+    def visible_columns(self) -> list[str]:
+        if self.show_all:
+            return list(self.known)
+        if self.custom_cols is not None:
+            cols = [c for c in self.custom_cols if c in self.known]
+            if cols:
+                return cols
+        return self.default_columns()
 
     def task_base(self, slot: int, mode: str, query: str, **extra) -> dict:
         return dict(slot=slot, gen=self.engine.bump(slot), mode=mode, query=query,
@@ -1241,6 +1336,8 @@ class LogSift(App):
         self.w_filter.focus()
 
     def check_action(self, action: str, parameters) -> bool:
+        if action == "columns":
+            return isinstance(self.screen, ColumnsScreen) or not isinstance(self.screen, ModalScreen)
         if action in ("toggle_cols", "export", "clear_files", "help", "files"):
             return not isinstance(self.screen, ModalScreen)
         return True
@@ -1292,6 +1389,24 @@ class LogSift(App):
                 self.start_search()
 
         self.push_screen(ValuesScreen(), picked)
+
+    def action_columns(self) -> None:
+        if isinstance(self.screen, ColumnsScreen):
+            self.screen.action_apply()
+            return
+        if not self.files:
+            self.set_status("No files loaded. Drag a folder or CSV files onto this window.")
+            return
+
+        def picked(result) -> None:
+            if result is not None:
+                self.custom_cols = result or None    # nothing ticked: back to the default set
+                self.show_all = False
+                self.start_search()
+
+        self.show_all = False
+        self.push_screen(
+            ColumnsScreen(self.known, self.visible_columns(), self.default_columns()), picked)
 
     def action_export(self) -> None:
         if not self.files:
@@ -1352,13 +1467,17 @@ def main() -> None:
     ap.add_argument("paths", nargs="*", type=Path, help="CSV files or folders to load")
     ap.add_argument("--max-rows", type=int, default=2000,
                     help="max matching rows shown in the table (default 2000)")
+    ap.add_argument("--columns", default="",
+                    help="comma-separated columns to show, e.g. date,src,dst,action "
+                         "(change in the app with F6)")
     args = ap.parse_args()
     missing = [p for p in args.paths if not p.exists()]
     if missing:
         sys.exit("Not found: " + ", ".join(map(str, missing)))
     engine = Engine()             # start worker processes before the UI takes the terminal
     try:
-        LogSift(args.paths, args.max_rows, engine).run()
+        LogSift(args.paths, args.max_rows, engine,
+                [c for c in args.columns.split(",") if c.strip()]).run()
     finally:
         engine.close()
 
