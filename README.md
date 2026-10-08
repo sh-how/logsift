@@ -66,7 +66,7 @@ As you type, the filter box suggests column names, and after `column=` it sugges
 
 ![Value suggestions after typing service=](screenshots/2-suggest.png)
 
-Value suggestions are sampled from the first 20,000 rows of each file, so a rare value may not be suggested. You can still type it: the search always covers every row. Values containing spaces are suggested once you open a quote, for example `fw_message="c`.
+Value suggestions are sampled from the first 5,000 rows of each file, so a rare value may not be suggested. You can still type it: the search always covers every row. Values containing spaces are suggested once you open a quote, for example `fw_message="c`.
 
 ### 4. See what values a column holds
 
@@ -102,7 +102,10 @@ Press F5 to write every matching row to `logsift_export_<timestamp>.csv` in the 
 ## Things to know
 
 - The table shows the first 2,000 matches. Change this with `--max-rows`. The status line always shows the full match count, and export writes all matches.
-- Each search re-reads the files from disk; there is no index. Three files totalling 180,000 rows take about 1 to 2 seconds.
+- Each search re-reads the files from disk; there is no index. Files are cut into pieces and scanned by several worker processes (one per CPU core, up to 8), so the window stays responsive during a search and a new search replaces a running one.
+- Terms such as `src=10.1.1.5`, `action=drop|reject`, `dst=192.168.0.0/16` or `fw_message~timeout` are the fastest: lines that do not contain that text are rejected before they are parsed. Comparisons (`>`, `<`), regular expressions and "not" terms have to parse every line and are slower.
+- On a 2-core machine, two 250 MB files (1.8 million rows, 86 columns) take about 1.5 to 2.5 seconds for the fast terms and about 5 seconds for the slow ones.
+- Result rows are added to the table as you scroll, so wide tables stay quick.
 - Files with different headers can be loaded together. A filter on a column that a file lacks skips that file, and the status line says how many were skipped.
 - Comma, semicolon, tab and pipe delimiters are detected per file.
 - The first line of each file is treated as the header.

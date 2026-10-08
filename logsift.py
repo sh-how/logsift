@@ -39,6 +39,14 @@ Keys
     F4 values: type a column name to list its distinct values with counts
        (within the current filter); Enter on a value adds it to the filter
     F8 clear files   Esc back to filter   Ctrl+Q quit
+
+Large files
+    Files are scanned in pieces by several worker processes (one per CPU core,
+    up to 8), so the window stays responsive while a search runs, and a new
+    search replaces a running one. Terms like src=10.1.1.5 or fw_message~timeout
+    are fastest: lines without that text are rejected before being parsed.
+    Comparisons (>, <), regular expressions and "not" terms have to parse every
+    line and are slower. Result rows are added to the table as you scroll.
 """
 from __future__ import annotations
 
@@ -48,11 +56,15 @@ import datetime as dt
 import difflib
 import fnmatch
 import ipaddress
+import multiprocessing
 import os
 import re
+import shutil
+import signal
 import sys
+import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -106,8 +118,9 @@ PREFERRED = [
     "date", "time", "orig", "action", "src", "dst", "proto", "service",
     "s_port", "rule", "i/f_name", "i/f_dir", "xlatesrc", "xlatedst", "user",
 ]
+PAGE = 200               # result rows added to the table ahead of the cursor
 CELL_WIDTH = 48          # long cells are truncated in the table (not in details)
-TICK = 20_000            # rows between progress updates / cancel checks
+CHUNK = 16 << 20         # bytes of a file handed to one worker process at a time
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +191,7 @@ def norm(name: str) -> str:
 class CsvFile:
     def __init__(self, path: Path):
         self.path = path
+        self.size = path.stat().st_size
         with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
             first = fh.readline()
         self.delim = max(",;\t|", key=lambda d: first.count(d)) if first.strip() else ","
@@ -186,12 +200,7 @@ class CsvFile:
         self.colmap: dict[str, int] = {}
         for i, h in enumerate(self.header):
             self.colmap.setdefault(norm(h), i)
-
-    def rows(self):
-        with open(self.path, newline="", encoding="utf-8-sig", errors="replace") as fh:
-            rd = csv.reader(fh, delimiter=self.delim)
-            next(rd, None)
-            yield from rd
+        self.plan = None          # AsyncResult of plan_file(), set by the app
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +238,22 @@ def _ip(s: str):
         return None
 
 
+def _ip4(s: str) -> int:
+    """IPv4 address as an integer, or -1 if s is not one."""
+    p = s.split(".")
+    if len(p) != 4:
+        return -1
+    v = 0
+    for x in p:
+        if not x.isdigit() or len(x) > 3 or (len(x) > 1 and x[0] == "0") or not x.isascii():
+            return -1
+        n = int(x)
+        if n > 255:
+            return -1
+        v = v << 8 | n
+    return v
+
+
 def build_test(op: str, raw: str):
     """Return a function cell -> bool for a (non-negated) operator."""
     if len(raw) > 2 and raw.startswith("/") and raw.endswith("/") and op in "=~":
@@ -254,7 +279,10 @@ def build_test(op: str, raw: str):
                     net = ipaddress.ip_network(a, strict=False)
                 except ValueError:
                     pass
-            if net is not None:
+            if net is not None and net.version == 4:
+                lo, hi = int(net.network_address), int(net.broadcast_address)
+                tests.append(lambda c, lo=lo, hi=hi: lo <= _ip4(c) <= hi)
+            elif net is not None:
                 tests.append(lambda c, n=net: (ip := _ip(c)) is not None
                              and ip.version == n.version and ip in n)
             elif "*" in a or "?" in a:
@@ -279,6 +307,37 @@ def build_test(op: str, raw: str):
     return compare
 
 
+def find_needles(op: str, raw: str):
+    """Text that must appear in the raw line for the term to match, or None.
+
+    Lets the scanner reject most lines with a substring check instead of
+    parsing them. One entry per '|' alternative; the line needs any of them.
+    """
+    if op not in ("=", "~") or (len(raw) > 2 and raw.startswith("/") and raw.endswith("/")):
+        return None
+    out = []
+    for a in raw.split("|"):
+        a = (a.strip() if op == "=" else a).lower()
+        if op == "=" and "/" in a:
+            try:
+                net = ipaddress.ip_network(a, strict=False)
+            except ValueError:
+                net = None
+            if net is not None:
+                keep = net.prefixlen // 8
+                if net.version != 4 or keep == 0:
+                    return None
+                a = ".".join(str(net.network_address).split(".")[:keep]) + ("." if keep < 4 else "")
+        elif op == "=" and ("*" in a or "?" in a):
+            if "[" in a:
+                return None
+            a = max(re.split(r"[*?]+", a), key=len)
+        if not a or '"' in a or not a.isascii():
+            return None
+        out.append(a)
+    return tuple(out)
+
+
 class Cond:
     """One filter term. col is a normalised column name, or None for 'any column'."""
 
@@ -286,6 +345,9 @@ class Cond:
         self.col = col
         self.negate = op.startswith("!")
         self.test = build_test(op.lstrip("!") or "~", raw)
+        found = find_needles(op.lstrip("!") or "~", raw)
+        self.needles = None if self.negate else found
+        self.anti = found if self.negate and col is None else None
 
 
 def parse_query(text: str, known: dict[str, str]) -> list[Cond]:
@@ -317,53 +379,321 @@ def parse_query(text: str, known: dict[str, str]) -> list[Cond]:
     return conds
 
 
-def iter_matches(files, conds, cancelled, stats, tick=None):
-    """Yield (file, row) for every row matching all conds. Updates stats['scanned']."""
-    for f in files:
-        compiled, skip = [], False
-        for c in conds:
-            idx = None if c.col is None else f.colmap.get(c.col, -1)
+# --------------------------------------------------------------------------
+# Scanning engine
+#
+# Files are cut into CHUNK-sized byte ranges and scanned by a pool of worker
+# processes, so the UI process never does heavy work and all cores are used.
+# Everything in this section runs inside the workers except Engine itself.
+# --------------------------------------------------------------------------
+
+SLOT_SCAN, SLOT_VALUES, SLOT_EXPORT = 0, 1, 2
+_GENS = None              # shared job counters; a task whose number is stale is skipped
+_COMPILED: dict = {}
+
+
+def _pool_init(gens) -> None:
+    global _GENS
+    _GENS = gens
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+    try:
+        os.nice(5)            # let the UI process win when all cores are busy
+    except (AttributeError, OSError):
+        pass
+
+
+def _stale(task) -> bool:
+    return _GENS is not None and _GENS[task["slot"]] != task["gen"]
+
+
+def split_records(text: str) -> list[str]:
+    """Split a block of CSV text into records (a quoted field may span lines)."""
+    lines = text.split("\n")
+    if '"' in text:
+        out, buf = [], None
+        for line in lines:
+            if buf is None:
+                if line.count('"') & 1:
+                    buf = [line]
+                else:
+                    out.append(line)
+            else:
+                buf.append(line)
+                if line.count('"') & 1:
+                    out.append("\n".join(buf))
+                    buf = None
+        if buf:
+            out.append("\n".join(buf))
+        lines = out
+    return [r for r in lines if r]
+
+
+def parse_records(recs: list[str], delim: str) -> list[list[str]]:
+    out = []
+    for r in recs:
+        if '"' in r:
+            out.append(next(csv.reader([r], delimiter=delim), []))
+        else:
+            out.append(r.split(delim))
+    return out
+
+
+def plan_file(path: str, delim: str) -> dict:
+    """Find safe places to cut a file into chunks, and sample its values.
+
+    A cut is only made at a newline that is outside any quoted field, which is
+    tracked by counting quote characters from the start of the file.
+    """
+    try:
+        size = os.path.getsize(path)
+        offsets = []
+        with open(path, "rb") as fh:
+            fh.readline()
+            pos = start = fh.tell()
+            head = fh.read(min(size - start, 4 << 20))
+            fh.seek(start)
+            offsets.append(start)
+            target, parity = start + CHUNK, 0
+            while True:
+                block = fh.read(4 << 20)
+                if not block:
+                    break
+                cur = 0
+                while target < pos + len(block):
+                    rel = max(target - pos, cur)
+                    parity ^= block.count(b'"', cur, rel) & 1
+                    cur = rel
+                    found = False
+                    while True:
+                        nl = block.find(b"\n", cur)
+                        if nl < 0:
+                            break
+                        parity ^= block.count(b'"', cur, nl) & 1
+                        cur = nl + 1
+                        if parity == 0:
+                            found = True
+                            break
+                    if not found:
+                        target = pos + len(block)      # keep looking in the next block
+                        break
+                    if pos + cur < size:
+                        offsets.append(pos + cur)
+                    target = pos + cur + CHUNK
+                parity ^= block.count(b'"', cur) & 1
+                pos += len(block)
+        offsets.append(size)
+        offsets = sorted(set(o for o in offsets if o <= size))
+
+        text = head.decode("utf-8", "replace").replace("\r\n", "\n")
+        if len(head) < size - start:
+            text = text[:text.rfind("\n") + 1]
+        counts: dict[int, Counter] = {}
+        for row in parse_records(split_records(text)[:INDEX_ROWS], delim):
+            for i, v in enumerate(row):
+                v = v.strip()
+                if v and len(v) <= 60:
+                    counts.setdefault(i, Counter())[v] += 1
+        sample = {i: c.most_common(300) for i, c in counts.items()}
+        return {"offsets": offsets, "sample": sample}
+    except OSError as e:
+        return {"error": str(e)}
+
+
+def _compile(task):
+    """(tests, needle groups, anti-needle groups, colmap) for this query against this file's header; cached."""
+    key = (task["query"], task["header"])
+    hit = _COMPILED.get(key)
+    if hit is None:
+        if len(_COMPILED) > 256:
+            _COMPILED.clear()
+        colmap: dict[str, int] = {}
+        for i, h in enumerate(task["header"]):
+            colmap.setdefault(norm(h), i)
+        tests, groups, anti = [], [], []
+        for c in parse_query(task["query"], dict(task["known"])):
+            idx = None if c.col is None else colmap.get(c.col, -1)
             if idx == -1:
                 if c.negate:
-                    continue          # column absent: "not X" is trivially true
-                skip = True           # column absent: positive test can't match
+                    continue                  # column absent: "not X" is trivially true
+                tests = None                  # column absent: nothing can match
                 break
-            compiled.append((idx, c.test, c.negate))
-        stats["file"] = f.path.name
-        if skip:
-            stats["skipped"] += 1
-            continue
-        n = 0
+            if idx is None and c.negate and c.anti:
+                anti.append(c.anti)           # "!word": handled on the raw line
+                continue
+            tests.append((idx, c.test, c.negate))
+            if c.needles:
+                groups.append(c.needles)
+        groups.sort(key=lambda g: -min(map(len, g)))
+        hit = _COMPILED[key] = (tests, groups, anti, colmap)
+    return hit
+
+
+def scan_chunk(task: dict):
+    """Scan one byte range of one file. Returns (records, matches, payload)."""
+    if _stale(task):
+        return None
+    with open(task["path"], "rb") as fh:
+        fh.seek(task["start"])
+        data = fh.read(task["end"] - task["start"])
+    text = data.decode("utf-8", "replace")
+    del data
+    if "\r" in text:
+        text = text.replace("\r\n", "\n")
+    recs = split_records(text)
+    del text
+    total = len(recs)
+    tests, groups, anti, colmap = _compile(task)
+    mode, delim, limit = task["mode"], task["delim"], task["limit"]
+    if tests is None:
+        return total, 0, Counter() if mode == "values" else []
+    for g in groups:                          # cheap rejection before any parsing
+        if len(g) == 1:
+            a = g[0]
+            recs = [r for r in recs if a in r.lower()]
+        else:
+            recs = [r for r in recs if _any_in(g, r.lower())]
+    for g in anti:
+        if delim not in "".join(g):
+            recs = [r for r in recs if not _any_in(g, r.lower())]
+        else:                                 # needle could span two cells: test per cell
+            tests = tests + [(None, build_test("~", "|".join(g)), True)]
+    if _stale(task):
+        return None
+
+    col = colmap[task["col"]] if mode == "values" else -1
+    counts: Counter = Counter()
+    rows: list = []
+    if not tests and mode != "values":
+        matched = len(recs)
+        rows = parse_records(recs[:limit] if mode == "rows" else recs, delim)
+    else:
+        # Split only as far as the last column needed; rows to return are re-split in full.
+        cut = -1 if any(t[0] is None for t in tests) else max([t[0] for t in tests] + [col]) + 1
+        keep = limit if mode == "rows" else (0 if mode == "values" else len(recs))
+        matched = 0
+        for r in recs:
+            if '"' in r:
+                row = next(csv.reader([r], delimiter=delim), [])
+                n, partial = len(row), False
+            else:
+                row = r.split(delim, cut)
+                partial = cut >= 0
+                n = min(len(row), cut) if partial else len(row)
+            for idx, test, neg in tests:
+                if idx is None:
+                    hit = any(test(c) for c in row)
+                else:
+                    hit = idx < n and bool(test(row[idx]))
+                if hit == neg:
+                    break
+            else:
+                matched += 1
+                if col >= 0:
+                    counts[row[col].strip() if col < n else ""] += 1
+                elif len(rows) < keep:
+                    rows.append(r.split(delim) if partial else row)
+    if mode == "rows":
+        return total, matched, rows
+    if mode == "values":
+        return total, matched, counts
+    idx = [colmap.get(c) for c in task["cols"]]             # mode == "export"
+    name = task["name"]
+    with open(task["part"], "w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerows(
+            [name] + [r[i] if i is not None and i < len(r) else "" for i in idx] for r in rows)
+    return total, matched, None
+
+
+def _any_in(alts, low: str) -> bool:
+    for a in alts:
+        if a in low:
+            return True
+    return False
+
+
+class Engine:
+    """Owns the worker processes. Lives in the UI process; does no heavy work itself."""
+
+    def __init__(self, procs: int | None = None):
+        n = procs or max(1, min(os.cpu_count() or 2, 8))
         try:
-            for row in f.rows():
-                n += 1
-                if n % TICK == 0:
-                    stats["scanned"] += TICK
-                    if cancelled():
+            self.gens = multiprocessing.Array("q", 3, lock=False)
+            self.pool = multiprocessing.Pool(n, _pool_init, (self.gens,))
+            self.procs = n
+        except Exception:                     # no multiprocessing here: use threads
+            from multiprocessing.pool import ThreadPool
+            self.gens = [0, 0, 0]
+            self.pool = ThreadPool(1, _pool_init, (self.gens,))
+            self.procs = 0
+
+    def close(self) -> None:
+        try:
+            self.pool.terminate()
+        except Exception:
+            pass
+
+    def bump(self, slot: int) -> int:
+        """Start a new job in this slot; queued work of the previous one is dropped."""
+        self.gens[slot] += 1
+        return self.gens[slot]
+
+    def plan(self, f: CsvFile) -> None:
+        f.plan = self.pool.apply_async(plan_file, (str(f.path), f.delim))
+
+    @staticmethod
+    def _wait(result, cancelled):
+        while not result.ready():
+            if cancelled():
+                return None
+            result.wait(0.05)
+        try:
+            return result.get()
+        except Exception as e:
+            return e
+
+    def run(self, files, base: dict, cancelled, per_task=None):
+        """Scan files chunk by chunk; yields (file, result, bytes) in file order.
+
+        result is scan_chunk()'s tuple, or an Exception / error string.
+        """
+        window = max(2, 2 * max(1, self.procs))
+        pending: deque = deque()
+
+        def take():
+            f, ar, nbytes = pending.popleft()
+            res = self._wait(ar, cancelled)
+            return None if res is None else (f, res, nbytes)
+
+        for f in files:
+            plan = self._wait(f.plan, cancelled)
+            if plan is None:
+                return
+            if isinstance(plan, Exception) or "error" in plan:
+                yield f, str(plan if isinstance(plan, Exception) else plan["error"]), f.size
+                continue
+            offs = plan["offsets"]
+            for a, b in zip(offs, offs[1:]):
+                while len(pending) >= window:
+                    got = take()
+                    if got is None:
                         return
-                    if tick:
-                        tick()
-                ok = True
-                for idx, test, neg in compiled:
-                    if idx is None:
-                        hit = any(test(c) for c in row)
-                    else:
-                        hit = idx < len(row) and bool(test(row[idx]))
-                    if hit == neg:
-                        ok = False
-                        break
-                if ok:
-                    yield f, row
-        except (OSError, csv.Error) as e:
-            stats["errors"].append(f"{f.path.name}: {e}")
-        stats["scanned"] += n % TICK
+                    yield got
+                task = dict(base, path=str(f.path), name=f.path.name, start=a, end=b,
+                            delim=f.delim, header=tuple(f.header))
+                if per_task:
+                    per_task(task)
+                pending.append((f, self.pool.apply_async(scan_chunk, (task,)), b - a))
+        while pending:
+            got = take()
+            if got is None:
+                return
+            yield got
 
 
-# --------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------
-
-INDEX_ROWS = 20_000      # rows per file sampled for value suggestions
+INDEX_ROWS = 5_000       # rows per file sampled for value suggestions
 INDEX_DISTINCT = 5_000   # distinct values remembered per column
 MAX_HINTS = 8
 
@@ -476,6 +806,7 @@ class ValuesScreen(ModalScreen):
 
     def action_close(self) -> None:
         self.workers.cancel_group(self, "values")
+        self.app.engine.bump(SLOT_VALUES)
         self.dismiss(None)
 
     def status(self, msg: str) -> None:
@@ -507,15 +838,16 @@ class ValuesScreen(ModalScreen):
         worker = get_current_worker()
         app = self.app
         files = [f for f in app.files.values() if col in f.colmap]
-        stats = {"scanned": 0, "skipped": 0, "errors": [], "file": ""}
+        base = app.task_base(SLOT_VALUES, "values", app.query_text, col=col)
         counts: Counter = Counter()
-
-        def tick() -> None:
-            app.call_from_thread(self.status, f"counting… {stats['scanned']:,} rows scanned")
-
-        for f, row in iter_matches(files, list(app.conds), lambda: worker.is_cancelled, stats, tick):
-            i = f.colmap[col]
-            counts[row[i].strip() if i < len(row) else ""] += 1
+        scanned, last = 0, 0.0
+        for f, res, _ in app.engine.run(files, base, lambda: worker.is_cancelled):
+            if isinstance(res, tuple):
+                scanned += res[0]
+                counts.update(res[2])
+            if time.monotonic() - last > 0.2 and not worker.is_cancelled:
+                last = time.monotonic()
+                app.call_from_thread(self.status, f"counting… {scanned:,} rows scanned")
         if not worker.is_cancelled:
             app.call_from_thread(self.show, col, counts, len(files))
 
@@ -531,7 +863,7 @@ class ValuesScreen(ModalScreen):
              Text(f"{n:,}", justify="right"), Text(f"{100 * n / total:.1f}", justify="right")]
             for v, n in top)
         msg = f"{len(counts):,} distinct values in {total:,} rows from {nfiles} file(s)"
-        if self.app.conds:
+        if self.app.query_text.strip():
             msg += " matching the current filter"
         if len(counts) > MAX_VALUES:
             msg += f" · showing top {MAX_VALUES:,}"
@@ -563,17 +895,21 @@ class LogSift(App):
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, paths: list[Path], max_rows: int):
+    def __init__(self, paths: list[Path], max_rows: int, engine: Engine | None = None):
         super().__init__()
+        self.engine = engine or Engine()
+        self.query_text = ""                 # the filter as last run
         self.initial_paths = paths
         self.max_rows = max_rows
         self.files: dict[Path, CsvFile] = {}
         self.known: dict[str, str] = {}      # normalised name -> display name
         self.conds: list[Cond] = []
         self.show_all = False
-        self.shown: list[tuple[CsvFile, list[str]]] = []
+        self.shown: list[tuple[CsvFile, list[str]]] = []   # results, up to max_rows
+        self.loaded = 0                                     # how many are in the table
         self.gen = 0
         self.value_index: dict[str, list[str]] = {}   # column -> values, commonest first
+        self._value_counts: dict[str, Counter] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -594,6 +930,7 @@ class LogSift(App):
 
     def on_mount(self) -> None:
         self.w_filter.focus()
+        self.watch(self.w_table, "scroll_y", lambda *_: self._fill(), init=False)
         if self.initial_paths:
             self.add_paths(self.initial_paths)
         else:
@@ -676,28 +1013,24 @@ class LogSift(App):
                 hint.append("   also: " + " · ".join(label for _, label in found[1:]), style="dim")
         self.w_hint.update(hint)
 
-    @work(thread=True, exclusive=True, group="index")
+    @work(thread=True, group="index")
     def build_index(self, files: list[CsvFile]) -> None:
-        """Sample each file to learn which values occur in which column."""
+        """Collect the value samples the worker processes took of each new file."""
         worker = get_current_worker()
-        counts: dict[str, Counter] = {}
         for f in files:
-            cols = [(i, counts.setdefault(norm(h), Counter()))
-                    for i, h in enumerate(f.header) if h]
-            try:
-                for n, row in enumerate(f.rows()):
-                    if n >= INDEX_ROWS:
-                        break
-                    if n % 2000 == 0 and worker.is_cancelled:
-                        return
-                    for i, c in cols:
-                        if i < len(row):
-                            v = row[i].strip()
-                            if v and len(v) <= 60 and (v in c or len(c) < INDEX_DISTINCT):
-                                c[v] += 1
-            except (OSError, csv.Error):
-                pass
-            self.value_index = {k: [v for v, _ in c.most_common()] for k, c in counts.items()}
+            plan = Engine._wait(f.plan, lambda: worker.is_cancelled)
+            if plan is None:
+                return
+            if isinstance(plan, Exception) or "error" in plan:
+                continue
+            for i, pairs in plan["sample"].items():
+                if i < len(f.header) and f.header[i]:
+                    c = self._value_counts.setdefault(norm(f.header[i]), Counter())
+                    for v, n in pairs:
+                        if v in c or len(c) < INDEX_DISTINCT:
+                            c[v] += n
+        self.value_index = {k: [v for v, _ in c.most_common()]
+                            for k, c in list(self._value_counts.items())}
 
     # ---- files ------------------------------------------------------------
 
@@ -708,7 +1041,7 @@ class LogSift(App):
             self.add_paths(paths)
 
     def add_paths(self, paths: list[Path]) -> None:
-        added, bad = 0, []
+        added, bad, new = 0, [], []
         for p in paths:
             try:
                 p = p.resolve()
@@ -719,7 +1052,9 @@ class LogSift(App):
                     found = [p]
                 for q in found:
                     if q not in self.files:
-                        self.files[q] = CsvFile(q)
+                        f = self.files[q] = CsvFile(q)
+                        self.engine.plan(f)
+                        new.append(f)
                         added += 1
             except OSError as e:
                 bad.append(f"{p.name}: {e}")
@@ -731,15 +1066,16 @@ class LogSift(App):
         if bad:
             self.notify("\n".join(bad[:5]), severity="error")
         self.notify(f"Added {added} file(s); {len(self.files)} loaded.")
-        self.build_index(list(self.files.values()))
+        self.build_index(new)
         self.start_search()
 
     def action_clear_files(self) -> None:
         self.gen += 1
         self.workers.cancel_group(self, "scan")
         self.workers.cancel_group(self, "index")
-        self.value_index = {}
-        self.files, self.known, self.shown = {}, {}, []
+        self.engine.bump(SLOT_SCAN)
+        self.value_index, self._value_counts = {}, {}
+        self.files, self.known, self.shown, self.loaded = {}, {}, [], 0
         self.w_table.clear(columns=True)
         self.set_status("No files loaded. Drag a folder or CSV files onto this window.")
 
@@ -762,15 +1098,27 @@ class LogSift(App):
                 cols.append(c.col)
         return cols or list(self.known)[:15]
 
+    def task_base(self, slot: int, mode: str, query: str, **extra) -> dict:
+        return dict(slot=slot, gen=self.engine.bump(slot), mode=mode, query=query,
+                    known=tuple(self.known.items()), limit=self.max_rows, **extra)
+
+    def usable_files(self, conds: list[Cond]) -> tuple[list[CsvFile], int]:
+        """Files that have every column the filter needs, and how many do not."""
+        need = {c.col for c in conds if c.col and not c.negate}
+        files = [f for f in self.files.values() if need <= f.colmap.keys()]
+        return files, len(self.files) - len(files)
+
     def start_search(self) -> None:
         if not self.files:
             self.set_status("No files loaded. Drag a folder or CSV files onto this window.")
             return
+        text = self.w_filter.value
         try:
-            self.conds = parse_query(self.w_filter.value, self.known)
+            self.conds = parse_query(text, self.known)
         except QueryError as e:
             self.set_status(str(e), error=True)
             return
+        self.query_text = text
         self.gen += 1
         cols = self.visible_columns()
         table = self.w_table
@@ -778,38 +1126,57 @@ class LogSift(App):
         table.add_column("file")
         for c in cols:
             table.add_column(self.known[c])
-        self.shown = []
-        self.scan(self.gen, list(self.files.values()), list(self.conds), cols)
+        self.shown, self.loaded = [], 0
+        files, skipped = self.usable_files(self.conds)
+        self.scan(self.gen, files, skipped, self.task_base(SLOT_SCAN, "rows", text))
 
     @work(thread=True, exclusive=True, group="scan")
-    def scan(self, gen: int, files: list[CsvFile], conds: list[Cond], cols: list[str]) -> None:
+    def scan(self, gen: int, files: list[CsvFile], skipped: int, base: dict) -> None:
         worker = get_current_worker()
-        stats = {"scanned": 0, "skipped": 0, "errors": [], "file": ""}
-        matched, batch, t0 = 0, [], time.monotonic()
+        total_bytes = sum(f.size for f in files) or 1
+        scanned = matched = done_bytes = shown = 0
+        errors: list[str] = []
+        batch: list = []
+        t0 = last = time.monotonic()
 
-        def flush(done: bool = False) -> None:
-            nonlocal batch
-            rows, batch = batch, []
-            msg = f"{len(files):,} files · {stats['scanned']:,} rows scanned · {matched:,} matches"
+        def status(done: bool = False) -> str:
+            msg = f"{len(files):,} files · {scanned:,} rows scanned · {matched:,} matches"
             if matched > self.max_rows:
                 msg += f" (showing first {self.max_rows:,}; F5 exports all)"
             if done:
                 msg += f" · {time.monotonic() - t0:.1f}s"
-                if stats["skipped"]:
-                    msg += f" · {stats['skipped']} file(s) lack a filtered column"
-                if stats["errors"]:
-                    msg += f" · {len(stats['errors'])} read error(s)"
+                if skipped:
+                    msg += f" · {skipped} file(s) lack a filtered column"
+                if errors:
+                    msg += f" · {len(errors)} read error(s): {errors[0]}"
             else:
-                msg += f" · scanning {stats['file']}…"
-            if not worker.is_cancelled:
-                self.call_from_thread(self._apply, gen, rows, msg)
+                msg += f" · {min(99, 100 * done_bytes // total_bytes)}%…"
+            return msg
 
-        for f, row in iter_matches(files, conds, lambda: worker.is_cancelled, stats, flush):
-            matched += 1
-            if matched <= self.max_rows:
-                batch.append((f, row))
-                if len(batch) >= 500:
-                    flush()
+        def flush(done: bool = False) -> None:
+            nonlocal batch, last
+            rows, batch = batch, []
+            last = time.monotonic()
+            if not worker.is_cancelled:
+                self.call_from_thread(self._apply, gen, rows, status(done))
+
+        def per_task(task: dict) -> None:
+            task["limit"] = max(0, self.max_rows - matched)
+
+        for f, res, nbytes in self.engine.run(files, base, lambda: worker.is_cancelled, per_task):
+            done_bytes += nbytes
+            if isinstance(res, tuple):
+                scanned += res[0]
+                matched += res[1]
+                room = self.max_rows - shown
+                if room > 0 and res[2]:
+                    rows = res[2][:room]
+                    shown += len(rows)
+                    batch.extend((f, r) for r in rows)
+            else:
+                errors.append(f"{f.path.name}: {res}")
+            if batch or time.monotonic() - last > 0.15:
+                flush()
         if not worker.is_cancelled:
             flush(done=True)
 
@@ -817,19 +1184,43 @@ class LogSift(App):
         if gen != self.gen:
             return
         if rows:
-            cols = self._current_cols
-            table = self.w_table
-            out = []
-            for f, row in rows:
-                cells = [f.path.name]
-                for c in cols:
-                    i = f.colmap.get(c)
-                    v = row[i] if i is not None and i < len(row) else ""
-                    cells.append(v if len(v) <= CELL_WIDTH else v[:CELL_WIDTH - 1] + "…")
-                out.append(cells)
-            table.add_rows(out)
             self.shown.extend(rows)
+            self._fill()
         self.set_status(msg)
+
+    def _fill(self) -> None:
+        """Put result rows into the table a page at a time, as the user nears them.
+
+        Filling the table is the costly part of showing results, so only rows
+        near the cursor / scroll position are added; the rest wait in self.shown.
+        """
+        table = self.w_table
+        if isinstance(self.screen, ModalScreen) and self.loaded >= PAGE:
+            return
+        cols = self._current_cols
+        ahead = max(2 * table.size.height, min(PAGE, 6000 // (len(cols) + 1)))
+        want = max(table.cursor_row, int(table.scroll_y) + table.size.height) + ahead
+        want = min(want, len(self.shown))
+        if self.loaded >= want:
+            return
+        step = max(5, 1000 // (len(cols) + 1))
+        chunk = self.shown[self.loaded:min(want, self.loaded + step)]
+        out = []
+        for f, row in chunk:
+            cells = [Text(f.path.name)]
+            for c in cols:
+                i = f.colmap.get(c)
+                v = row[i] if i is not None and i < len(row) else ""
+                cells.append(Text(v if len(v) <= CELL_WIDTH else v[:CELL_WIDTH - 1] + "…"))
+            out.append(cells)
+        table.add_rows(out)
+        self.loaded += len(chunk)
+        if self.loaded < want:
+            self.set_timer(0.02, self._fill)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table is self.w_table:
+            self._fill()
 
     @property
     def _current_cols(self) -> list[str]:
@@ -898,36 +1289,55 @@ class LogSift(App):
     def action_export(self) -> None:
         if not self.files:
             return
+        text = self.w_filter.value
         try:
-            conds = parse_query(self.w_filter.value, self.known)
+            conds = parse_query(text, self.known)
         except QueryError as e:
             self.set_status(str(e), error=True)
             return
         out = Path.cwd() / f"logsift_export_{dt.datetime.now():%Y%m%d_%H%M%S}.csv"
         self.notify(f"Exporting to {out.name}…")
-        self.export(list(self.files.values()), conds, list(self.known), out)
+        cols = list(self.known)
+        files, _ = self.usable_files(conds)
+        self.export(files, self.task_base(SLOT_EXPORT, "export", text, cols=cols), cols, out)
 
     @work(thread=True, exclusive=True, group="export")
-    def export(self, files, conds, cols, out: Path) -> None:
+    def export(self, files, base: dict, cols, out: Path) -> None:
+        """Workers write each chunk's matches to a part file; parts are joined in order."""
         worker = get_current_worker()
-        stats = {"scanned": 0, "skipped": 0, "errors": [], "file": ""}
-        n = 0
+        n, parts, tmp = 0, 0, None
         try:
+            tmp = Path(tempfile.mkdtemp(prefix=".logsift_export_", dir=out.parent))
+
+            queued: deque = deque()
+
+            def per_task(task: dict) -> None:
+                nonlocal parts
+                parts += 1
+                task["part"] = str(tmp / f"{parts:08d}.csv")
+                queued.append(task["part"])
+
             with open(out, "w", newline="", encoding="utf-8") as fh:
-                w = csv.writer(fh)
-                w.writerow(["source_file"] + [self.known[c] for c in cols])
-                proj: dict[Path, list] = {}
-                for f, row in iter_matches(files, conds, lambda: worker.is_cancelled, stats):
-                    idx = proj.get(f.path)
-                    if idx is None:
-                        idx = proj[f.path] = [f.colmap.get(c) for c in cols]
-                    w.writerow([f.path.name] + [
-                        row[i] if i is not None and i < len(row) else "" for i in idx])
-                    n += 1
+                csv.writer(fh).writerow(["source_file"] + [self.known[c] for c in cols])
+            with open(out, "ab") as fh:
+                for f, res, _ in self.engine.run(files, base, lambda: worker.is_cancelled, per_task):
+                    if isinstance(res, str):          # file could not be read at all
+                        continue
+                    part = queued.popleft()
+                    if not isinstance(res, tuple):
+                        continue
+                    n += res[1]
+                    with open(part, "rb") as src:
+                        shutil.copyfileobj(src, fh, 1 << 20)
+                    os.unlink(part)
         except OSError as e:
             self.call_from_thread(self.notify, f"Export failed: {e}", severity="error")
             return
-        self.call_from_thread(self.notify, f"Exported {n:,} rows to {out}", timeout=10)
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        if not worker.is_cancelled:
+            self.call_from_thread(self.notify, f"Exported {n:,} rows to {out}", timeout=10)
 
 
 def main() -> None:
@@ -939,7 +1349,11 @@ def main() -> None:
     missing = [p for p in args.paths if not p.exists()]
     if missing:
         sys.exit("Not found: " + ", ".join(map(str, missing)))
-    LogSift(args.paths, args.max_rows).run()
+    engine = Engine()             # start worker processes before the UI takes the terminal
+    try:
+        LogSift(args.paths, args.max_rows, engine).run()
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":
